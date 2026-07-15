@@ -1,0 +1,6 @@
+<resources>
+    <style name="Theme.HideMediaApp" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#4F6EF7</item>
+        <item name="android:windowBackground">#111318</item>
+    </style>
+</resources>
