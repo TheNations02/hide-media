@@ -1,5 +1,6 @@
 package com.hidemedia.app
 
+import android.content.ContentUris
 import android.content.Intent
 import android.content.SharedPreferences
 import android.media.MediaScannerConnection
@@ -14,39 +15,25 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.Collections
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
-/**
- * App muy simple: un botón central.
- * - Primer toque: mueve TODAS las fotos y videos del almacenamiento
- *   compartido (DCIM, Pictures, Movies, WhatsApp, etc.) a una carpeta
- *   privada de la app, que la galería del sistema no puede ver.
- * - Segundo toque: los mueve de vuelta exactamente a su carpeta original.
- *
- * La carpeta privada donde se guardan temporalmente se llama ".ocultados"
- * (dentro del espacio privado de la app), y además incluye un archivo
- * .nomedia como refuerzo para que ningún escáner de medios la indexe.
- *
- * Solo se ocultan los archivos que existían en el momento del toque.
- * Cualquier foto o video nuevo que tomes mientras está "oculto" queda
- * normal y visible en la galería, porque la app no vigila continuamente,
- * solo actúa en el instante en que tocas el botón.
- *
- * Requiere el permiso "Acceso a todos los archivos" (Android 11+),
- * porque se necesita mover archivos reales fuera de la carpeta propia
- * de la app, algo que el almacenamiento restringido normal no permite.
- */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: SharedPreferences
     private lateinit var statusText: TextView
     private lateinit var toggleButton: Button
-    private lateinit var hiddenDir: File
     private lateinit var manifestFile: File
+
+    private var hiddenDirs: List<File> = emptyList()
+    private val nameCounter = AtomicInteger(0)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -59,13 +46,6 @@ class MainActivity : AppCompatActivity() {
         prefs = getSharedPreferences("hide_media_prefs", MODE_PRIVATE)
         statusText = findViewById(R.id.statusText)
         toggleButton = findViewById(R.id.toggleButton)
-
-        hiddenDir = File(getExternalFilesDir(null), ".ocultados")
-        if (!hiddenDir.exists()) hiddenDir.mkdirs()
-        // Refuerzo extra: un .nomedia impide que CUALQUIER escáner de medios
-        // (aunque cambie de opinión sobre carpetas con punto) indexe esta carpeta.
-        val nomedia = File(hiddenDir, ".nomedia")
-        if (!nomedia.exists()) nomedia.createNewFile()
         manifestFile = File(filesDir, "manifest.json")
 
         checkPermissionAndUpdateUI()
@@ -89,9 +69,37 @@ class MainActivity : AppCompatActivity() {
             toggleButton.text = "Conceder permiso"
             toggleButton.setOnClickListener { requestAllFilesPermission() }
         } else {
+            setupHiddenDirs()
             val hidden = prefs.getBoolean("is_hidden", false)
             updateButtonState(hidden)
             toggleButton.setOnClickListener { onToggleClicked() }
+        }
+    }
+
+    private fun setupHiddenDirs() {
+        val roots = mutableListOf<File>()
+        val externalDirs = ContextCompat.getExternalFilesDirs(this, null)
+        for (dir in externalDirs) {
+            if (dir == null) continue
+            val path = dir.absolutePath
+            val cutIndex = path.indexOf("/Android/data")
+            val rootPath = if (cutIndex > 0) path.substring(0, cutIndex) else null
+            if (rootPath != null) {
+                val root = File(rootPath)
+                if (root.exists()) roots.add(root)
+            }
+        }
+        if (roots.isEmpty()) {
+            roots.add(Environment.getExternalStorageDirectory())
+        }
+        hiddenDirs = roots.map { root ->
+            val dir = File(root, ".ocultados")
+            if (!dir.exists()) dir.mkdirs()
+            val nomedia = File(dir, ".nomedia")
+            if (!nomedia.exists()) {
+                try { nomedia.createNewFile() } catch (e: Exception) { /* ignorar */ }
+            }
+            dir
         }
     }
 
@@ -146,82 +154,135 @@ class MainActivity : AppCompatActivity() {
         }.start()
     }
 
-    /** Recorre MediaStore para encontrar todas las fotos y videos reales en el dispositivo. */
-    private fun collectMediaFiles(): List<File> {
-        val files = mutableListOf<File>()
+    private data class MediaEntry(val file: File, val uri: Uri)
+
+    private fun collectMediaEntries(): List<MediaEntry> {
+        val results = mutableListOf<MediaEntry>()
         val collections = listOf(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
             MediaStore.Video.Media.EXTERNAL_CONTENT_URI
         )
         for (collection in collections) {
-            val projection = arrayOf(MediaStore.MediaColumns.DATA)
+            val projection = arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DATA)
             contentResolver.query(collection, projection, null, null, null)?.use { cursor ->
+                val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
                 val dataCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA)
                 while (cursor.moveToNext()) {
                     val path = cursor.getString(dataCol) ?: continue
                     val f = File(path)
-                    if (f.exists() && !f.path.startsWith(hiddenDir.path)) {
-                        files.add(f)
+                    if (f.exists() && !isInsideAnyHiddenDir(f)) {
+                        val id = cursor.getLong(idCol)
+                        val uri = ContentUris.withAppendedId(collection, id)
+                        results.add(MediaEntry(f, uri))
                     }
                 }
             }
         }
-        return files
+        return results
+    }
+
+    private fun isInsideAnyHiddenDir(file: File): Boolean {
+        return hiddenDirs.any { file.path.startsWith(it.path) }
+    }
+
+    private fun hiddenDirForFile(file: File): File {
+        val match = hiddenDirs.firstOrNull { hidden ->
+            val root = hidden.parentFile ?: return@firstOrNull false
+            file.path.startsWith(root.path)
+        }
+        return match ?: hiddenDirs.first()
+    }
+
+    private fun uniqueDestName(file: File): String {
+        return "${System.currentTimeMillis()}_${nameCounter.incrementAndGet()}_${file.name}"
+    }
+
+    private fun moveManyInParallel(
+        jobs: List<Pair<File, File>>
+    ): List<Pair<File, File>> {
+        if (jobs.isEmpty()) return emptyList()
+        val threadCount = minOf(8, Runtime.getRuntime().availableProcessors() * 2).coerceAtLeast(2)
+        val executor = Executors.newFixedThreadPool(threadCount)
+        val succeeded = Collections.synchronizedList(mutableListOf<Pair<File, File>>())
+
+        val futures = jobs.map { (source, dest) ->
+            executor.submit {
+                try {
+                    if (moveFile(source, dest)) {
+                        succeeded.add(source to dest)
+                    }
+                } catch (e: Exception) {
+                    // se ignora este archivo, seguimos con los demás
+                }
+            }
+        }
+        futures.forEach {
+            try { it.get() } catch (e: Exception) { /* ignorar */ }
+        }
+        executor.shutdown()
+        return succeeded.toList()
     }
 
     private fun hideAllMedia() {
-        val files = collectMediaFiles()
-        val manifest = JSONArray()
-        val scannedOriginals = mutableListOf<String>()
+        val entries = collectMediaEntries()
 
-        for (file in files) {
-            try {
-                val destName = "${System.currentTimeMillis()}_${files.indexOf(file)}_${file.name}"
-                val dest = File(hiddenDir, destName)
-                if (moveFile(file, dest)) {
-                    val entry = JSONObject()
-                    entry.put("original", file.absolutePath)
-                    entry.put("hidden", dest.absolutePath)
-                    manifest.put(entry)
-                    scannedOriginals.add(file.absolutePath)
-                }
-            } catch (e: Exception) {
-                // si un archivo falla, seguimos con los demás
-            }
+        val jobs = entries.map { entry ->
+            val targetDir = hiddenDirForFile(entry.file)
+            val dest = File(targetDir, uniqueDestName(entry.file))
+            entry.file to dest
         }
+        val moved = moveManyInParallel(jobs)
 
+        val manifest = JSONArray()
+        for ((source, dest) in moved) {
+            val entry = JSONObject()
+            entry.put("original", source.absolutePath)
+            entry.put("hidden", dest.absolutePath)
+            entry.put("lastModified", dest.lastModified())
+            manifest.put(entry)
+        }
         manifestFile.writeText(manifest.toString())
 
-        // Avisamos al escáner de medios de que los archivos originales ya no existen,
-        // para que desaparezcan de la galería inmediatamente.
-        if (scannedOriginals.isNotEmpty()) {
-            MediaScannerConnection.scanFile(this, scannedOriginals.toTypedArray(), null, null)
+        val movedOriginalPaths = moved.map { it.first.absolutePath }.toSet()
+        for (entry in entries) {
+            if (entry.file.absolutePath in movedOriginalPaths) {
+                try {
+                    contentResolver.delete(entry.uri, null, null)
+                } catch (e: Exception) {
+                    MediaScannerConnection.scanFile(this, arrayOf(entry.file.absolutePath), null, null)
+                }
+            }
         }
     }
 
     private fun restoreAllMedia() {
         if (!manifestFile.exists()) return
         val manifest = JSONArray(manifestFile.readText())
-        val scannedRestored = mutableListOf<String>()
 
+        val jobs = mutableListOf<Pair<File, File>>()
+        val lastModifiedMap = mutableMapOf<String, Long>()
         for (i in 0 until manifest.length()) {
             val entry = manifest.getJSONObject(i)
-            val originalPath = entry.getString("original")
-            val hiddenPath = entry.getString("hidden")
-            val hiddenFile = File(hiddenPath)
-            val originalFile = File(originalPath)
-            try {
-                originalFile.parentFile?.mkdirs()
-                if (moveFile(hiddenFile, originalFile)) {
-                    scannedRestored.add(originalFile.absolutePath)
-                }
-            } catch (e: Exception) {
-                // seguimos con los demás
+            val originalFile = File(entry.getString("original"))
+            val hiddenFile = File(entry.getString("hidden"))
+            originalFile.parentFile?.mkdirs()
+            jobs.add(hiddenFile to originalFile)
+            if (entry.has("lastModified")) {
+                lastModifiedMap[originalFile.absolutePath] = entry.getLong("lastModified")
             }
         }
 
-        if (scannedRestored.isNotEmpty()) {
-            MediaScannerConnection.scanFile(this, scannedRestored.toTypedArray(), null, null)
+        val moved = moveManyInParallel(jobs)
+
+        for ((_, dest) in moved) {
+            lastModifiedMap[dest.absolutePath]?.let { originalTime ->
+                try { dest.setLastModified(originalTime) } catch (e: Exception) { /* ignorar */ }
+            }
+        }
+
+        val restoredPaths = moved.map { it.second.absolutePath }
+        if (restoredPaths.isNotEmpty()) {
+            MediaScannerConnection.scanFile(this, restoredPaths.toTypedArray(), null, null)
         }
 
         manifestFile.delete()
@@ -229,14 +290,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun moveFile(source: File, dest: File): Boolean {
         if (source.renameTo(dest)) return true
-        // Si renameTo falla (por ejemplo, entre distintos volúmenes de almacenamiento),
-        // hacemos copia + borrado como respaldo.
         return try {
+            val originalTime = source.lastModified()
             FileInputStream(source).use { input ->
                 FileOutputStream(dest).use { output ->
                     input.copyTo(output)
                 }
             }
+            dest.setLastModified(originalTime)
             source.delete()
             true
         } catch (e: Exception) {
